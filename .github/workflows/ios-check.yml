@@ -1,0 +1,126 @@
+# Builds the iOS app for the simulator and runs the test suite on a hosted Mac,
+# for the fix branch and for the commit it is based on, so the two can be compared.
+# Lives on its own branch in the fork; it is not part of the pull request.
+
+name: iOS build and test check
+
+on:
+  push:
+    branches: [ci/macos-check]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    name: ${{ matrix.label }}
+    runs-on: macos-26
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: fix branch
+            ref: harden-untrusted-input
+          - label: base 366637a
+            ref: 366637a69b674911201f18296bfce4bc54caaa73
+    env:
+      SCHEME: Arke mobile
+      # Suites the change touches. RelayRateLimitRetryTests only exists on the fix branch.
+      TOUCHED: >-
+        -only-testing:ArkeMobileTests/AddressValidatorTests
+        -only-testing:ArkeMobileTests/LightningInvoiceParserTests
+        -only-testing:ArkeMobileTests/LNURLResolverTests
+        -only-testing:ArkeMobileTests/FeeRateServiceTests
+        -only-testing:ArkeMobileTests/RelayRegistrationRenewalTests
+        -only-testing:ArkeMobileTests/StaleWakeDecisionTests
+        -only-testing:ArkeMobileTests/RelayRateLimitRetryTests
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+
+      # The summary script lives on this workflow's branch, not on the ref under test
+      - uses: actions/checkout@v4
+        with:
+          path: .ci
+
+      - name: Select Xcode
+        run: |
+          ls -d /Applications/Xcode*.app || true
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | grep -viE 'beta|candidate' | sort -V | tail -1 || true)
+          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XC/Contents/Developer"
+          xcodebuild -version
+          echo "::notice title=Toolchain::$(xcodebuild -version | tr '\n' ' ')on macOS $(sw_vers -productVersion), commit $(git rev-parse --short HEAD)"
+
+      - name: Pick a simulator
+        run: |
+          xcrun simctl list devices available
+          SIM=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          best = None
+          for runtime, devices in json.load(sys.stdin)["devices"].items():
+              if "iOS" not in runtime:
+                  continue
+              version = tuple(int(x) for x in runtime.split("iOS-")[-1].split("-"))
+              for device in devices:
+                  if device.get("isAvailable") and device["name"].startswith("iPhone"):
+                      if best is None or version > best[0]:
+                          best = (version, device["udid"], device["name"])
+          print(best[1])
+          sys.stderr.write("using %s on iOS %s\n" % (best[2], ".".join(map(str, best[0]))))
+          ')
+          echo "SIM=$SIM" >> "$GITHUB_ENV"
+
+      - name: Build for testing
+        run: |
+          set +e
+          xcodebuild build-for-testing -project Arke.xcodeproj -scheme "$SCHEME" \
+            -destination "id=$SIM" -derivedDataPath DerivedData \
+            -skipPackagePluginValidation -skipMacroValidation > build.log 2>&1
+          rc=$?
+          grep -E "error: |\*\* TEST BUILD (SUCCEEDED|FAILED) \*\*" build.log | sort -u | head -80
+          if [ $rc -ne 0 ]; then
+            grep -E "error: " build.log | sort -u | head -9 | while IFS= read -r line; do echo "::error title=Build::$line"; done
+            echo "::error title=Build::TEST BUILD FAILED (exit $rc)"
+            tail -40 build.log
+            exit $rc
+          fi
+          echo "::notice title=Build::TEST BUILD SUCCEEDED for the iOS Simulator"
+
+      - name: Tests - suites touched by the change
+        run: |
+          set +e
+          xcodebuild test-without-building -project Arke.xcodeproj -scheme "$SCHEME" \
+            -destination "id=$SIM" -derivedDataPath DerivedData -parallel-testing-enabled NO \
+            $TOUCHED -resultBundlePath touched.xcresult > touched.log 2>&1
+          rc=$?
+          python3 .ci/.github/scripts/summarize.py touched.xcresult "Touched suites" error
+          grep -E "\*\* TEST (EXECUTE )?(SUCCEEDED|FAILED) \*\*|Testing failed|error: " touched.log | sort -u | head -20
+          exit $rc
+
+      - name: Tests - full suite
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          xcodebuild test-without-building -project Arke.xcodeproj -scheme "$SCHEME" \
+            -destination "id=$SIM" -derivedDataPath DerivedData -parallel-testing-enabled NO \
+            -resultBundlePath full.xcresult > full.log 2>&1
+          rc=$?
+          python3 .ci/.github/scripts/summarize.py full.xcresult "Full suite" warning
+          grep -E "\*\* TEST (EXECUTE )?(SUCCEEDED|FAILED) \*\*|Testing failed" full.log | sort -u | head -20
+          exit $rc
+
+      - name: Keep logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ strategy.job-index }}
+          path: |
+            build.log
+            touched.log
+            full.log
+          if-no-files-found: ignore

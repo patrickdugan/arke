@@ -1,5 +1,6 @@
 # Builds the iOS app for the simulator and runs the test suite on a hosted Mac,
 # for the fix branch and for the commit it is based on, so the two can be compared.
+# A third job runs the new tests against the unfixed sources and must see them fail.
 # Lives on its own branch in the fork; it is not part of the pull request.
 
 name: iOS build and test check
@@ -25,7 +26,13 @@ jobs:
             ref: harden-untrusted-input
           - label: base 366637a
             ref: 366637a69b674911201f18296bfce4bc54caaa73
+          # The new test cases with the sources they exercise put back to the base
+          # commit. This job is green only if those tests FAIL.
+          - label: new tests on unfixed sources (must fail)
+            ref: harden-untrusted-input
+            unfix: true
     env:
+      BASE: 366637a69b674911201f18296bfce4bc54caaa73
       SCHEME: Arke mobile
       # Suites the change touches. RelayRateLimitRetryTests only exists on the fix branch.
       TOUCHED: >-
@@ -40,11 +47,20 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ matrix.ref }}
+          fetch-depth: ${{ matrix.unfix && 0 || 1 }}
 
       # The summary script lives on this workflow's branch, not on the ref under test
       - uses: actions/checkout@v4
         with:
           path: .ci
+
+      - name: Put the unfixed sources back under the new tests
+        if: matrix.unfix
+        run: |
+          # The relay retry suite calls a function that only exists with the fix and
+          # would not compile, so its test file goes back to the base commit as well.
+          git checkout "$BASE" -- Shared ArkeMobile Tests/Shared/RelayRegistrationFreshnessTests.swift
+          git status --short
 
       - name: Select Xcode
         run: |
@@ -97,12 +113,20 @@ jobs:
             -destination "id=$SIM" -derivedDataPath DerivedData -parallel-testing-enabled NO \
             $TOUCHED -resultBundlePath touched.xcresult > touched.log 2>&1
           rc=$?
-          python3 .ci/.github/scripts/summarize.py touched.xcresult "Touched suites" error
-          grep -E "\*\* TEST (EXECUTE )?(SUCCEEDED|FAILED) \*\*|Testing failed|error: " touched.log | sort -u | head -20
+          python3 .ci/.github/scripts/summarize.py touched.xcresult "Touched suites" ${{ matrix.unfix && 'notice' || 'error' }}
+          grep -E "\*\* TEST (EXECUTE )?(SUCCEEDED|FAILED) \*\*|Testing failed|error: |Fatal error" touched.log | sort -u | head -20
+          if [ "${{ matrix.unfix }}" = "true" ]; then
+            if [ $rc -eq 0 ]; then
+              echo "::error title=Unfixed sources::the new tests passed without the fix, so they prove nothing"
+              exit 1
+            fi
+            echo "::notice title=Unfixed sources::the new tests fail without the fix, as intended (xcodebuild exit $rc)"
+            exit 0
+          fi
           exit $rc
 
       - name: Tests - full suite
-        if: always()
+        if: always() && !matrix.unfix
         continue-on-error: true
         run: |
           set +e

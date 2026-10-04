@@ -47,7 +47,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ matrix.ref }}
-          fetch-depth: ${{ matrix.unfix && 0 || 1 }}
 
       # The summary script lives on this workflow's branch, not on the ref under test
       - uses: actions/checkout@v4
@@ -59,6 +58,8 @@ jobs:
         run: |
           # The relay retry suite calls a function that only exists with the fix and
           # would not compile, so its test file goes back to the base commit as well.
+          # The checkout above is shallow, so fetch the base commit explicitly.
+          git fetch --no-tags --depth 1 origin "$BASE"
           git checkout "$BASE" -- Shared ArkeMobile Tests/Shared/RelayRegistrationFreshnessTests.swift
           git status --short
 
